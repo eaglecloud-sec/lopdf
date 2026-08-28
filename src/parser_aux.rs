@@ -201,8 +201,41 @@ fn try_to_replace_encoded_text(
 }
 
 /// Decode CrossReferenceStream
-pub fn decode_xref_stream(mut stream: Stream) -> Result<(Xref, Dictionary)> {
-    stream.decompress();
+pub fn decode_xref_stream(stream: Stream) -> Result<(Xref, Dictionary)> {
+    decode_xref_stream_with_limit(stream, None)
+}
+
+pub fn decode_xref_stream_with_limit(
+    stream: Stream, max_decompressed_size: Option<usize>,
+) -> Result<(Xref, Dictionary)> {
+    decode_xref_stream_with_limits(stream, max_decompressed_size, None)
+}
+
+pub(crate) fn claim_cumulative_decompressed_bytes(
+    used: &std::sync::atomic::AtomicUsize, additional: usize, limit: usize,
+) -> Result<()> {
+    let result = used.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| current.checked_add(additional).filter(|total| *total <= limit),
+    );
+    match result {
+        Ok(_) => Ok(()),
+        Err(_) => Err(Error::CumulativeDecompressionLimitExceeded { limit }),
+    }
+}
+
+pub fn decode_xref_stream_with_limits(
+    mut stream: Stream, max_decompressed_size: Option<usize>,
+    cumulative_budget: Option<(&std::sync::atomic::AtomicUsize, usize)>,
+) -> Result<(Xref, Dictionary)> {
+    match max_decompressed_size {
+        Some(max) => stream.decompress_with_limit(max)?,
+        None => stream.decompress(),
+    }
+    if let Some((used, limit)) = cumulative_budget {
+        claim_cumulative_decompressed_bytes(used, stream.content.len(), limit)?;
+    }
     let mut dict = stream.dict;
     let mut reader = Cursor::new(stream.content);
     let size = dict

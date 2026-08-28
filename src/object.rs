@@ -622,6 +622,16 @@ impl Stream {
         }
     }
 
+    pub fn get_plain_content_with_limit(&self, max_output: usize) -> Result<Vec<u8>> {
+        if self.dict.has(b"Filter") {
+            self.decompressed_content_with_limit(max_output)
+        } else if self.content.len() <= max_output {
+            Ok(self.content.clone())
+        } else {
+            Err(Error::DecompressionLimitExceeded { limit: max_output })
+        }
+    }
+
     pub fn compress(&mut self) -> Result<()> {
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
@@ -640,6 +650,14 @@ impl Stream {
     }
 
     pub fn decompressed_content(&self) -> Result<Vec<u8>> {
+        self.decode_filters(None)
+    }
+
+    pub fn decompressed_content_with_limit(&self, max_output: usize) -> Result<Vec<u8>> {
+        self.decode_filters(Some(max_output))
+    }
+
+    fn decode_filters(&self, limit: Option<usize>) -> Result<Vec<u8>> {
         let params = self.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
         let filters = self.filters()?;
 
@@ -653,17 +671,27 @@ impl Stream {
         // Filters are in decoding order.
         for filter in filters {
             output = match filter.as_str() {
-                "FlateDecode" => Self::decompress_zlib(input, params)?,
-                "LZWDecode" => Self::decompress_lzw(input, params)?,
-                "ASCII85Decode" => Self::decode_ascii85(input),
+                "FlateDecode" => Self::decompress_zlib(input, params, limit)?,
+                "LZWDecode" => Self::decompress_lzw(input, params, limit)?,
+                "ASCII85Decode" => Self::decode_ascii85(input, limit)?,
                 _ => return Err(Error::Type),
             };
+            Self::check_decompression_limit(output.len(), limit)?;
             input = &output;
         }
         Ok(output)
     }
 
-    fn decompress_lzw(input: &[u8], params: Option<&Dictionary>) -> Result<Vec<u8>> {
+    fn check_decompression_limit(len: usize, limit: Option<usize>) -> Result<()> {
+        if let Some(max) = limit {
+            if len > max {
+                return Err(Error::DecompressionLimitExceeded { limit: max });
+            }
+        }
+        Ok(())
+    }
+
+    fn decompress_lzw(input: &[u8], params: Option<&Dictionary>, limit: Option<usize>) -> Result<Vec<u8>> {
         use weezl::{decode::Decoder, BitOrder};
         const MIN_BITS: u8 = 9;
 
@@ -679,14 +707,23 @@ impl Stream {
             Decoder::new(BitOrder::Msb, MIN_BITS - 1)
         };
 
-        let output = Self::decompress_lzw_loop(input, &mut decoder);
-        Self::decompress_predictor(output, params)
+        let output = Self::decompress_lzw_loop(input, &mut decoder, limit);
+        Self::check_decompression_limit(output.len(), limit)?;
+        let output = Self::decompress_predictor(output, params, limit)?;
+        Self::check_decompression_limit(output.len(), limit)?;
+        Ok(output)
     }
 
-    fn decompress_lzw_loop(input: &[u8], decoder: &mut weezl::decode::Decoder) -> Vec<u8> {
+    fn decompress_lzw_loop(input: &[u8], decoder: &mut weezl::decode::Decoder, limit: Option<usize>) -> Vec<u8> {
         let mut output = vec![];
 
-        let result = decoder.into_stream(&mut output).decode_all(input);
+        let result = match limit {
+            Some(max) => {
+                let mut writer = LimitedWriter::new(&mut output, max.saturating_add(1));
+                decoder.into_stream(&mut writer).decode_all(input)
+            }
+            None => decoder.into_stream(&mut output).decode_all(input),
+        };
         if let Err(err) = result.status {
             warn!("{}", err);
         }
@@ -694,28 +731,48 @@ impl Stream {
         output
     }
 
-    fn decompress_zlib(input: &[u8], params: Option<&Dictionary>) -> Result<Vec<u8>> {
+    fn decompress_zlib(input: &[u8], params: Option<&Dictionary>, limit: Option<usize>) -> Result<Vec<u8>> {
         use flate2::read::ZlibDecoder;
         use std::io::prelude::*;
 
-        let mut output = Vec::with_capacity(input.len() * 2);
+        let capacity = limit
+            .map(|max| input.len().saturating_mul(2).min(max.saturating_add(1)))
+            .unwrap_or_else(|| input.len().saturating_mul(2));
+        let mut output = Vec::with_capacity(capacity);
         let mut decoder = ZlibDecoder::new(input);
 
         if !input.is_empty() {
-            decoder.read_to_end(&mut output).unwrap_or_else(|err| {
-                warn!("{}", err);
-                0
-            });
+            match limit {
+                Some(max) => {
+                    decoder
+                        .take((max as u64).saturating_add(1))
+                        .read_to_end(&mut output)
+                        .unwrap_or_else(|err| {
+                            warn!("{}", err);
+                            0
+                        });
+                }
+                None => {
+                    decoder.read_to_end(&mut output).unwrap_or_else(|err| {
+                        warn!("{}", err);
+                        0
+                    });
+                }
+            }
         }
-        Self::decompress_predictor(output, params)
+        Self::check_decompression_limit(output.len(), limit)?;
+        let output = Self::decompress_predictor(output, params, limit)?;
+        Self::check_decompression_limit(output.len(), limit)?;
+        Ok(output)
     }
 
-    fn decode_ascii85(input: &[u8]) -> Vec<u8> {
+    fn decode_ascii85(input: &[u8], limit: Option<usize>) -> Result<Vec<u8>> {
         let mut output = vec![];
         let mut buffer: u32 = 0;
         let mut count = 0;
 
         for &ch in input {
+            Self::check_decompression_limit(output.len(), limit)?;
             if ch == b'z' && count == 0 {
                 output.extend_from_slice(&[0, 0, 0, 0]);
                 continue;
@@ -747,19 +804,31 @@ impl Stream {
             output.extend_from_slice(&bytes[..count - 1]);
         }
 
-        output
+        Self::check_decompression_limit(output.len(), limit)?;
+        Ok(output)
     }
 
-    fn decompress_predictor(mut data: Vec<u8>, params: Option<&Dictionary>) -> Result<Vec<u8>> {
+    fn decompress_predictor(mut data: Vec<u8>, params: Option<&Dictionary>, limit: Option<usize>) -> Result<Vec<u8>> {
         use crate::filters::png;
 
         if let Some(params) = params {
             let predictor = params.get(b"Predictor").and_then(Object::as_i64).unwrap_or(1);
             if (10..=15).contains(&predictor) {
-                let pixels_per_row = max(1, params.get(b"Columns").and_then(Object::as_i64).unwrap_or(1)) as usize;
-                let colors = max(1, params.get(b"Colors").and_then(Object::as_i64).unwrap_or(1)) as usize;
-                let bits = max(8, params.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8)) as usize;
-                let bytes_per_pixel = colors * bits / 8;
+                let pixels_per_row =
+                    usize::try_from(max(1, params.get(b"Columns").and_then(Object::as_i64).unwrap_or(1)))
+                        .map_err(|_| Error::ContentDecode)?;
+                let colors = usize::try_from(max(1, params.get(b"Colors").and_then(Object::as_i64).unwrap_or(1)))
+                    .map_err(|_| Error::ContentDecode)?;
+                let bits = usize::try_from(max(
+                    8,
+                    params.get(b"BitsPerComponent").and_then(Object::as_i64).unwrap_or(8),
+                ))
+                .map_err(|_| Error::ContentDecode)?;
+                let bytes_per_pixel = colors.checked_mul(bits).ok_or(Error::ContentDecode)? / 8;
+                let bytes_per_row = bytes_per_pixel
+                    .checked_mul(pixels_per_row)
+                    .ok_or(Error::ContentDecode)?;
+                Self::check_decompression_limit(bytes_per_row, limit)?;
                 data = png::decode_frame(data.as_slice(), bytes_per_pixel, pixels_per_row)?;
             }
             Ok(data)
@@ -774,5 +843,98 @@ impl Stream {
             self.dict.remove(b"Filter");
             self.set_content(data);
         }
+    }
+
+    pub fn decompress_with_limit(&mut self, max_output: usize) -> Result<()> {
+        let data = self.get_plain_content_with_limit(max_output)?;
+        self.dict.remove(b"DecodeParms");
+        self.dict.remove(b"Filter");
+        self.set_content(data);
+        Ok(())
+    }
+}
+
+struct LimitedWriter<'a> {
+    output: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl<'a> LimitedWriter<'a> {
+    fn new(output: &'a mut Vec<u8>, limit: usize) -> Self {
+        Self { output, limit }
+    }
+}
+
+impl std::io::Write for LimitedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.output.len());
+        let accepted = remaining.min(buf.len());
+        self.output.extend_from_slice(&buf[..accepted]);
+        if accepted == 0 && !buf.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "decompression limit reached",
+            ));
+        }
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod decompression_limit_tests {
+    use std::io::Write;
+
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+
+    use super::{Dictionary, Stream};
+    use crate::Error;
+
+    #[test]
+    fn uncompressed_stream_honors_limit() {
+        let stream = Stream::new(Dictionary::new(), vec![0; 17]);
+        assert!(matches!(
+            stream.get_plain_content_with_limit(16),
+            Err(Error::DecompressionLimitExceeded { limit: 16 })
+        ));
+    }
+
+    #[test]
+    fn flate_stream_rejects_expansion_past_limit() {
+        let plain = vec![b'A'; 2 * 1024 * 1024];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut dict = Dictionary::new();
+        dict.set("Filter", "FlateDecode");
+        let stream = Stream::new(dict, compressed);
+
+        assert!(matches!(
+            stream.decompressed_content_with_limit(1024 * 1024),
+            Err(Error::DecompressionLimitExceeded { limit: 1048576 })
+        ));
+        assert_eq!(stream.decompressed_content_with_limit(plain.len()).unwrap(), plain);
+    }
+
+    #[test]
+    fn predictor_row_allocation_honors_limit() {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&[0, 1]).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut decode_params = Dictionary::new();
+        decode_params.set("Predictor", 12);
+        decode_params.set("Columns", i64::MAX);
+        let mut dict = Dictionary::new();
+        dict.set("Filter", "FlateDecode");
+        dict.set("DecodeParms", decode_params);
+        let stream = Stream::new(dict, compressed);
+
+        assert!(stream.decompressed_content_with_limit(1024 * 1024).is_err());
     }
 }

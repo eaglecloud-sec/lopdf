@@ -433,7 +433,11 @@ pub fn xref_and_trailer(input: &[u8], reader: &Reader) -> crate::Result<(Xref, D
             _indirect_object(input, 0, None, reader, &mut HashSet::new())
                 .map(|(_, obj)| {
                     let res = match obj {
-                        Object::Stream(stream) => decode_xref_stream(stream),
+                        Object::Stream(stream) => crate::parser_aux::decode_xref_stream_with_limits(
+                            stream,
+                            reader.max_decompressed_size,
+                            reader.cumulative_decompression_budget(),
+                        ),
                         _ => Err(Error::Xref(XrefError::Parse)),
                     };
                     (input, res)

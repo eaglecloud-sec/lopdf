@@ -9,6 +9,7 @@ use std::fs::File;
 #[cfg(not(feature = "async"))]
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 #[cfg(feature = "rayon")]
@@ -60,6 +61,10 @@ impl Document {
         Reader {
             buffer: &buffer,
             document: Document::new(),
+            max_decompressed_size: None,
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
         }
         .read(filter_func)
     }
@@ -67,6 +72,52 @@ impl Document {
     /// Load a PDF document from a memory slice.
     pub fn load_mem(buffer: &[u8]) -> Result<Document> {
         buffer.try_into()
+    }
+
+    /// Load a PDF from memory while bounding eager object/xref stream decoding.
+    pub fn load_mem_with_decompression_limit(buffer: &[u8], max_decompressed_size: usize) -> Result<Document> {
+        Reader {
+            buffer,
+            document: Document::new(),
+            max_decompressed_size: Some(max_decompressed_size),
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
+        }
+        .read(None)
+    }
+
+    /// Load a PDF from memory with bounded eager decompression and a
+    /// cooperative cancellation/deadline callback polled during traversal.
+    pub fn load_mem_with_decompression_limit_and_abort_check(
+        buffer: &[u8], max_decompressed_size: usize, abort_check: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Document> {
+        Reader {
+            buffer,
+            document: Document::new(),
+            max_decompressed_size: Some(max_decompressed_size),
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: Some(abort_check),
+        }
+        .read(None)
+    }
+
+    /// Load a PDF from memory with per-stream and whole-document eager
+    /// decompression limits plus cooperative cancellation/deadline polling.
+    pub fn load_mem_with_decompression_limits_and_abort_check(
+        buffer: &[u8], max_decompressed_size: usize, max_total_decompressed_size: usize,
+        abort_check: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Document> {
+        Reader {
+            buffer,
+            document: Document::new(),
+            max_decompressed_size: Some(max_decompressed_size),
+            max_total_decompressed_size: Some(max_total_decompressed_size),
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: Some(abort_check),
+        }
+        .read(None)
     }
 }
 
@@ -97,6 +148,10 @@ impl Document {
         Reader {
             buffer: &buffer,
             document: Document::new(),
+            max_decompressed_size: None,
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
         }
         .read(filter_func)
     }
@@ -104,6 +159,19 @@ impl Document {
     /// Load a PDF document from a memory slice.
     pub fn load_mem(buffer: &[u8]) -> Result<Document> {
         buffer.try_into()
+    }
+
+    /// Load a PDF from memory while bounding eager object/xref stream decoding.
+    pub fn load_mem_with_decompression_limit(buffer: &[u8], max_decompressed_size: usize) -> Result<Document> {
+        Reader {
+            buffer,
+            document: Document::new(),
+            max_decompressed_size: Some(max_decompressed_size),
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
+        }
+        .read(None)
     }
 }
 
@@ -114,6 +182,10 @@ impl TryInto<Document> for &[u8] {
         Reader {
             buffer: self,
             document: Document::new(),
+            max_decompressed_size: None,
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
         }
         .read(None)
     }
@@ -142,6 +214,10 @@ impl IncrementalDocument {
         let document = Reader {
             buffer: &buffer,
             document: Document::new(),
+            max_decompressed_size: None,
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
         }
         .read(None)?;
 
@@ -180,6 +256,10 @@ impl IncrementalDocument {
         let document = Reader {
             buffer: &buffer,
             document: Document::new(),
+            max_decompressed_size: None,
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
         }
         .read(None)?;
 
@@ -199,6 +279,10 @@ impl TryInto<IncrementalDocument> for &[u8] {
         let document = Reader {
             buffer: self,
             document: Document::new(),
+            max_decompressed_size: None,
+            max_total_decompressed_size: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: None,
         }
         .read(None)?;
 
@@ -209,6 +293,10 @@ impl TryInto<IncrementalDocument> for &[u8] {
 pub struct Reader<'a> {
     pub buffer: &'a [u8],
     pub document: Document,
+    pub max_decompressed_size: Option<usize>,
+    pub max_total_decompressed_size: Option<usize>,
+    pub decompressed_size: AtomicUsize,
+    pub abort_check: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 
 /// Maximum allowed embedding of literal strings.
@@ -217,6 +305,7 @@ pub const MAX_BRACKET: usize = 100;
 impl<'a> Reader<'a> {
     /// Read whole document.
     pub fn read(mut self, filter_func: Option<FilterFunc>) -> Result<Document> {
+        self.check_abort()?;
         // The document structure can be expressed in PEG as:
         //   document <- header indirect_object* xref trailer xref_start
         let version = parser::header(self.buffer).ok_or(Error::Header)?;
@@ -228,11 +317,13 @@ impl<'a> Reader<'a> {
         self.document.xref_start = xref_start;
 
         let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self)?;
+        self.check_abort()?;
 
         // Read previous Xrefs of linearized or incremental updated document.
         let mut already_seen = HashSet::new();
         let mut prev_xref_start = trailer.get(b"Prev").cloned();
         while let Ok(prev) = prev_xref_start.and_then(|offset| offset.as_i64()) {
+            self.check_abort()?;
             if already_seen.contains(&prev) {
                 break;
             }
@@ -242,6 +333,7 @@ impl<'a> Reader<'a> {
             }
 
             let (prev_xref, prev_trailer) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+            self.check_abort()?;
             xref.merge(prev_xref);
 
             // Read xref stream in hybrid-reference file
@@ -252,6 +344,7 @@ impl<'a> Reader<'a> {
                 }
 
                 let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+                self.check_abort()?;
                 xref.merge(prev_xref);
             }
 
@@ -274,8 +367,14 @@ impl<'a> Reader<'a> {
 
         let zero_length_streams = Mutex::new(vec![]);
         let object_streams = Mutex::new(vec![]);
+        let aborted = AtomicBool::new(false);
+        let cumulative_limit_exceeded = AtomicBool::new(false);
 
         let entries_filter_map = |(_, entry): (&_, &_)| {
+            if self.abort_requested() {
+                aborted.store(true, Ordering::Relaxed);
+                return None;
+            }
             if let XrefEntry::Normal { offset, .. } = *entry {
                 let (object_id, mut object) = self
                     .read_object(offset as usize, None, &mut HashSet::new())
@@ -286,7 +385,21 @@ impl<'a> Reader<'a> {
                 }
                 if let Ok(ref mut stream) = object.as_stream_mut() {
                     if stream.dict.type_is(b"ObjStm") {
-                        let obj_stream = ObjectStream::new(stream).ok()?;
+                        let obj_stream = ObjectStream::new_with_limits_and_abort_check(
+                            stream,
+                            self.max_decompressed_size,
+                            self.cumulative_decompression_budget(),
+                            self.abort_check,
+                        )
+                        .map_err(|err| {
+                            if matches!(err, Error::Aborted) {
+                                aborted.store(true, Ordering::Relaxed);
+                            }
+                            if matches!(err, Error::CumulativeDecompressionLimitExceeded { .. }) {
+                                cumulative_limit_exceeded.store(true, Ordering::Relaxed);
+                            }
+                        })
+                        .ok()?;
                         let mut object_streams = object_streams.lock().unwrap();
                         // TODO: Is insert and replace intended behavior?
                         // See https://github.com/J-F-Liu/lopdf/issues/160 for more info
@@ -294,7 +407,14 @@ impl<'a> Reader<'a> {
                             let objects: BTreeMap<(u32, u16), Object> = obj_stream
                                 .objects
                                 .into_iter()
-                                .filter_map(|(object_id, mut object)| filter_func(object_id, &mut object))
+                                .filter_map(|(object_id, mut object)| {
+                                    if self.abort_requested() {
+                                        aborted.store(true, Ordering::Relaxed);
+                                        None
+                                    } else {
+                                        filter_func(object_id, &mut object)
+                                    }
+                                })
                                 .collect();
                             object_streams.extend(objects);
                         } else {
@@ -330,16 +450,43 @@ impl<'a> Reader<'a> {
                 .filter_map(entries_filter_map)
                 .collect();
         }
+        if aborted.load(Ordering::Relaxed) {
+            return Err(Error::Aborted);
+        }
+        if cumulative_limit_exceeded.load(Ordering::Relaxed) {
+            return Err(Error::CumulativeDecompressionLimitExceeded {
+                limit: self.max_total_decompressed_size.unwrap_or(0),
+            });
+        }
         // Only add entries, but never replace entries
         for (id, entry) in object_streams.into_inner().unwrap() {
+            self.check_abort()?;
             self.document.objects.entry(id).or_insert(entry);
         }
 
         for object_id in zero_length_streams.into_inner().unwrap() {
+            self.check_abort()?;
             let _ = self.set_stream_content(object_id);
         }
 
         Ok(self.document)
+    }
+
+    fn abort_requested(&self) -> bool {
+        self.abort_check.map(|check| check()).unwrap_or(false)
+    }
+
+    pub(crate) fn cumulative_decompression_budget(&self) -> Option<(&AtomicUsize, usize)> {
+        self.max_total_decompressed_size
+            .map(|limit| (&self.decompressed_size, limit))
+    }
+
+    fn check_abort(&self) -> Result<()> {
+        if self.abort_requested() {
+            Err(Error::Aborted)
+        } else {
+            Ok(())
+        }
     }
 
     fn set_stream_content(&mut self, object_id: ObjectId) -> Result<()> {
@@ -474,6 +621,14 @@ fn load_document() {
     let temp_dir = tempfile::tempdir().unwrap();
     let file_path = temp_dir.path().join("test_2_load.pdf");
     doc.save(file_path).unwrap();
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn bounded_load_honors_abort_check() {
+    let bytes = std::fs::read("assets/example.pdf").unwrap();
+    let err = Document::load_mem_with_decompression_limit_and_abort_check(&bytes, 1024 * 1024, &|| true).unwrap_err();
+    assert!(matches!(err, Error::Aborted));
 }
 
 #[cfg(all(test, feature = "async"))]

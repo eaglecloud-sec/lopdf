@@ -5,12 +5,19 @@ use crate::encodings::cmap::UnicodeCMapError;
 
 #[derive(Debug)]
 pub enum Error {
+    /// Parsing was aborted by a caller-provided cooperative check.
+    Aborted,
     /// Brackets limit reached.
     /// To many brackets nested.
     // TODO: This does not seem to be used.
     BracketLimit,
     /// Could not decode content.
     ContentDecode,
+    /// A compressed stream exceeded the caller-provided decoded-byte limit.
+    DecompressionLimitExceeded { limit: usize },
+    /// Eager stream decoding across the document exceeded the caller-provided
+    /// cumulative decoded-byte limit.
+    CumulativeDecompressionLimitExceeded { limit: usize },
     /// Error when decrypting the contents of the file
     Decryption(encryption::DecryptionError),
     /// Dictionary key was not found.
@@ -60,8 +67,15 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Error::Aborted => write!(f, "Parsing aborted by caller"),
             Error::BracketLimit => write!(f, "Too deep embedding of ()'s."),
             Error::ContentDecode => write!(f, "Could not decode content"),
+            Error::DecompressionLimitExceeded { limit } => {
+                write!(f, "Decompressed stream exceeded the {} byte limit", limit)
+            }
+            Error::CumulativeDecompressionLimitExceeded { limit } => {
+                write!(f, "Cumulative decompressed streams exceeded the {} byte limit", limit)
+            }
             Error::Decryption(d) => d.fmt(f),
             Error::DictKey => write!(f, "A required dictionary key was not found"),
             Error::Header => write!(f, "Invalid file header"),
