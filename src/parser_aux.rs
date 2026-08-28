@@ -226,8 +226,15 @@ pub(crate) fn claim_cumulative_decompressed_bytes(
 }
 
 pub fn decode_xref_stream_with_limits(
-    mut stream: Stream, max_decompressed_size: Option<usize>,
+    stream: Stream, max_decompressed_size: Option<usize>,
     cumulative_budget: Option<(&std::sync::atomic::AtomicUsize, usize)>,
+) -> Result<(Xref, Dictionary)> {
+    decode_xref_stream_with_limits_and_object_limit(stream, max_decompressed_size, cumulative_budget, None)
+}
+
+pub fn decode_xref_stream_with_limits_and_object_limit(
+    mut stream: Stream, max_decompressed_size: Option<usize>,
+    cumulative_budget: Option<(&std::sync::atomic::AtomicUsize, usize)>, max_objects: Option<usize>,
 ) -> Result<(Xref, Dictionary)> {
     match max_decompressed_size {
         Some(max) => stream.decompress_with_limit(max)?,
@@ -242,6 +249,14 @@ pub fn decode_xref_stream_with_limits(
         .get(b"Size")
         .and_then(Object::as_i64)
         .map_err(|_| Error::Xref(XrefError::Parse))?;
+    if size < 0 || size > i64::from(u32::MAX) {
+        return Err(Error::Xref(XrefError::Parse));
+    }
+    if let Some(limit) = max_objects {
+        if size as usize > limit {
+            return Err(Error::ObjectLimitExceeded { limit });
+        }
+    }
     let mut xref = Xref::new(size as u32, XrefType::CrossReferenceStream);
     {
         let section_indice = dict
@@ -265,9 +280,21 @@ pub fn decode_xref_stream_with_limits(
         let mut bytes2 = vec![0_u8; field_widths[1] as usize];
         let mut bytes3 = vec![0_u8; field_widths[2] as usize];
 
+        let mut declared_entries = 0usize;
         for i in 0..section_indice.len() / 2 {
             let start = section_indice[2 * i];
             let count = section_indice[2 * i + 1];
+            if start < 0 || count < 0 {
+                return Err(Error::Xref(XrefError::Parse));
+            }
+            declared_entries = declared_entries
+                .checked_add(count as usize)
+                .ok_or(Error::Xref(XrefError::Parse))?;
+            if let Some(limit) = max_objects {
+                if declared_entries > limit {
+                    return Err(Error::ObjectLimitExceeded { limit });
+                }
+            }
 
             for j in 0..count {
                 let entry_type = if !bytes1.is_empty() {
@@ -326,6 +353,28 @@ fn parse_integer_array(array: &Object) -> Result<Vec<i64>> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod object_limit_tests {
+    use crate::{Error, Object, Stream};
+
+    #[test]
+    fn xref_stream_declared_entries_are_bounded_before_materialization() {
+        let stream = Stream::new(
+            dictionary! {
+                "Type" => "XRef",
+                "Size" => 1_000_000,
+                "W" => vec![Object::Integer(0), Object::Integer(0), Object::Integer(0)],
+                "Index" => vec![Object::Integer(0), Object::Integer(1_000_000)],
+            },
+            Vec::new(),
+        );
+
+        let err =
+            super::decode_xref_stream_with_limits_and_object_limit(stream, Some(1024), None, Some(100)).unwrap_err();
+        assert!(matches!(err, Error::ObjectLimitExceeded { limit: 100 }));
+    }
 }
 
 #[cfg(all(test, not(feature = "async")))]

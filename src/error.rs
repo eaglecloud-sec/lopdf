@@ -18,6 +18,9 @@ pub enum Error {
     /// Eager stream decoding across the document exceeded the caller-provided
     /// cumulative decoded-byte limit.
     CumulativeDecompressionLimitExceeded { limit: usize },
+    /// The document declared or materialized more structural objects than
+    /// the caller-provided limit.
+    ObjectLimitExceeded { limit: usize },
     /// Error when decrypting the contents of the file
     Decryption(encryption::DecryptionError),
     /// Dictionary key was not found.
@@ -75,6 +78,9 @@ impl fmt::Display for Error {
             }
             Error::CumulativeDecompressionLimitExceeded { limit } => {
                 write!(f, "Cumulative decompressed streams exceeded the {} byte limit", limit)
+            }
+            Error::ObjectLimitExceeded { limit } => {
+                write!(f, "PDF structural objects exceeded the {} object limit", limit)
             }
             Error::Decryption(d) => d.fmt(f),
             Error::DictKey => write!(f, "A required dictionary key was not found"),

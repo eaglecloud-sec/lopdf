@@ -261,10 +261,11 @@ fn _xref_and_trailer<'a>(reader: &'a Reader) -> Parser<'a, u8, (Xref, Dictionary
             .map_err(|_| Error::Trailer)? as u32;
         Ok((xref, trailer))
     }) | _indirect_object(None, reader).convert(|(_, obj)| match obj {
-        Object::Stream(stream) => crate::parser_aux::decode_xref_stream_with_limits(
+        Object::Stream(stream) => crate::parser_aux::decode_xref_stream_with_limits_and_object_limit(
             stream,
             reader.max_decompressed_size,
             reader.cumulative_decompression_budget(),
+            reader.max_objects,
         ),
         _ => Err(Error::Xref(XrefError::Parse)),
     })

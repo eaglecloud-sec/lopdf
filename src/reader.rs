@@ -24,7 +24,7 @@ use tokio::pin;
 use crate::error::XrefError;
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::XrefEntry;
+use crate::xref::{Xref, XrefEntry};
 use crate::{Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 type FilterFunc = fn((u32, u16), &mut Object) -> Option<((u32, u16), Object)>;
@@ -63,6 +63,7 @@ impl Document {
             document: Document::new(),
             max_decompressed_size: None,
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -81,6 +82,7 @@ impl Document {
             document: Document::new(),
             max_decompressed_size: Some(max_decompressed_size),
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -97,6 +99,7 @@ impl Document {
             document: Document::new(),
             max_decompressed_size: Some(max_decompressed_size),
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: Some(abort_check),
         }
@@ -114,6 +117,25 @@ impl Document {
             document: Document::new(),
             max_decompressed_size: Some(max_decompressed_size),
             max_total_decompressed_size: Some(max_total_decompressed_size),
+            max_objects: None,
+            decompressed_size: AtomicUsize::new(0),
+            abort_check: Some(abort_check),
+        }
+        .read(None)
+    }
+
+    /// Load a PDF from memory with bounded eager decompression, a hard
+    /// structural-object limit, and cooperative cancellation/deadline polling.
+    pub fn load_mem_with_decompression_and_object_limits_and_abort_check(
+        buffer: &[u8], max_decompressed_size: usize, max_total_decompressed_size: usize, max_objects: usize,
+        abort_check: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Document> {
+        Reader {
+            buffer,
+            document: Document::new(),
+            max_decompressed_size: Some(max_decompressed_size),
+            max_total_decompressed_size: Some(max_total_decompressed_size),
+            max_objects: Some(max_objects),
             decompressed_size: AtomicUsize::new(0),
             abort_check: Some(abort_check),
         }
@@ -150,6 +172,7 @@ impl Document {
             document: Document::new(),
             max_decompressed_size: None,
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -168,6 +191,7 @@ impl Document {
             document: Document::new(),
             max_decompressed_size: Some(max_decompressed_size),
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -184,6 +208,7 @@ impl TryInto<Document> for &[u8] {
             document: Document::new(),
             max_decompressed_size: None,
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -216,6 +241,7 @@ impl IncrementalDocument {
             document: Document::new(),
             max_decompressed_size: None,
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -258,6 +284,7 @@ impl IncrementalDocument {
             document: Document::new(),
             max_decompressed_size: None,
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -281,6 +308,7 @@ impl TryInto<IncrementalDocument> for &[u8] {
             document: Document::new(),
             max_decompressed_size: None,
             max_total_decompressed_size: None,
+            max_objects: None,
             decompressed_size: AtomicUsize::new(0),
             abort_check: None,
         }
@@ -295,6 +323,7 @@ pub struct Reader<'a> {
     pub document: Document,
     pub max_decompressed_size: Option<usize>,
     pub max_total_decompressed_size: Option<usize>,
+    pub max_objects: Option<usize>,
     pub decompressed_size: AtomicUsize,
     pub abort_check: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
@@ -317,6 +346,7 @@ impl<'a> Reader<'a> {
         self.document.xref_start = xref_start;
 
         let (mut xref, mut trailer) = parser::xref_and_trailer(&self.buffer[xref_start..], &self)?;
+        self.check_xref_object_limit(&xref)?;
         self.check_abort()?;
 
         // Read previous Xrefs of linearized or incremental updated document.
@@ -333,7 +363,9 @@ impl<'a> Reader<'a> {
             }
 
             let (prev_xref, prev_trailer) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+            self.check_xref_object_limit(&prev_xref)?;
             self.check_abort()?;
+            self.check_merged_xref_object_limit(&xref, &prev_xref)?;
             xref.merge(prev_xref);
 
             // Read xref stream in hybrid-reference file
@@ -344,7 +376,9 @@ impl<'a> Reader<'a> {
                 }
 
                 let (prev_xref, _) = parser::xref_and_trailer(&self.buffer[prev as usize..], &self)?;
+                self.check_xref_object_limit(&prev_xref)?;
                 self.check_abort()?;
+                self.check_merged_xref_object_limit(&xref, &prev_xref)?;
                 xref.merge(prev_xref);
             }
 
@@ -367,8 +401,10 @@ impl<'a> Reader<'a> {
 
         let zero_length_streams = Mutex::new(vec![]);
         let object_streams = Mutex::new(vec![]);
+        let object_stream_object_count = AtomicUsize::new(0);
         let aborted = AtomicBool::new(false);
         let cumulative_limit_exceeded = AtomicBool::new(false);
+        let object_limit_exceeded = AtomicBool::new(false);
 
         let entries_filter_map = |(_, entry): (&_, &_)| {
             if self.abort_requested() {
@@ -385,10 +421,11 @@ impl<'a> Reader<'a> {
                 }
                 if let Ok(ref mut stream) = object.as_stream_mut() {
                     if stream.dict.type_is(b"ObjStm") {
-                        let obj_stream = ObjectStream::new_with_limits_and_abort_check(
+                        let obj_stream = ObjectStream::new_with_limits_and_object_budget_and_abort_check(
                             stream,
                             self.max_decompressed_size,
                             self.cumulative_decompression_budget(),
+                            self.max_objects.map(|limit| (&object_stream_object_count, limit)),
                             self.abort_check,
                         )
                         .map_err(|err| {
@@ -397,6 +434,9 @@ impl<'a> Reader<'a> {
                             }
                             if matches!(err, Error::CumulativeDecompressionLimitExceeded { .. }) {
                                 cumulative_limit_exceeded.store(true, Ordering::Relaxed);
+                            }
+                            if matches!(err, Error::ObjectLimitExceeded { .. }) {
+                                object_limit_exceeded.store(true, Ordering::Relaxed);
                             }
                         })
                         .ok()?;
@@ -458,6 +498,11 @@ impl<'a> Reader<'a> {
                 limit: self.max_total_decompressed_size.unwrap_or(0),
             });
         }
+        if object_limit_exceeded.load(Ordering::Relaxed) {
+            return Err(Error::ObjectLimitExceeded {
+                limit: self.max_objects.unwrap_or(0),
+            });
+        }
         // Only add entries, but never replace entries
         for (id, entry) in object_streams.into_inner().unwrap() {
             self.check_abort()?;
@@ -474,6 +519,30 @@ impl<'a> Reader<'a> {
 
     fn abort_requested(&self) -> bool {
         self.abort_check.map(|check| check()).unwrap_or(false)
+    }
+
+    fn check_xref_object_limit(&self, xref: &Xref) -> Result<()> {
+        if let Some(limit) = self.max_objects {
+            if xref.size as usize > limit || xref.entries.len() > limit {
+                return Err(Error::ObjectLimitExceeded { limit });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_merged_xref_object_limit(&self, current: &Xref, additional: &Xref) -> Result<()> {
+        if let Some(limit) = self.max_objects {
+            let new_entries = additional
+                .entries
+                .keys()
+                .filter(|id| !current.entries.contains_key(id))
+                .take(limit.saturating_add(1))
+                .count();
+            if current.entries.len().saturating_add(new_entries) > limit {
+                return Err(Error::ObjectLimitExceeded { limit });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn cumulative_decompression_budget(&self) -> Option<(&AtomicUsize, usize)> {
